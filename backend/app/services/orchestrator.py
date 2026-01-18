@@ -1,18 +1,15 @@
 import uuid
 import time
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 from app.core.logging import get_logger
-from app.db.database import init_database
 from app.db.crud import create_run, save_incident
-from app.models.schemas import (
-    AnalyzeResponse, IncidentSummary, IncidentDetail,
-    IncidentStats, ValidationResult
-)
+from app.models.schemas import AnalyzeResponse, IncidentSummary
 from app.services.pipeline_interfaces import (
     parse_lines, group_and_rank, build_evidence, generate_incident_id
 )
 from app.services.guardrails import get_validated_explanation
+from app.services.ranking import priority_from_score, compute_signals, score_incident
 
 logger = get_logger(__name__)
 
@@ -100,15 +97,24 @@ def analyze_log_file(file_bytes: bytes, filename: str) -> AnalyzeResponse:
 
             incident_id = generate_incident_id(run_id, group.signature, rank)
 
-            # Calculate score
-            score = _calculate_score(group.count, group.severity)
+            # Calculate score using ranking module
+            signals = compute_signals(
+                count=group.count,
+                severity=group.severity,
+                services=group.services,
+                last_seen=group.time_window.last_seen,
+                time_span_seconds=evidence.stats.time_span_seconds,
+            )
+            score = score_incident(group.severity, signals)
+            priority = priority_from_score(score)
 
             processed_incidents.append({
                 'incident_id': incident_id,
                 'run_id': run_id,
                 'rank': rank,
                 'signature': group.signature,
-                'score': score,
+                'score': round(score, 4),
+                'priority': priority.value,
                 'severity': group.severity,
                 'title': explanation.incident_title,
                 'count': group.count,
@@ -140,10 +146,11 @@ def analyze_log_file(file_bytes: bytes, filename: str) -> AnalyzeResponse:
             num_lines=len(lines),
             num_incidents=len(processed_incidents),
             incidents=[
-                IncidentSummary(
+    IncidentSummary(
                     incident_id=inc['incident_id'],
                     rank=inc['rank'],
                     score=inc['score'],
+                    priority=inc['priority'],
                     severity=inc['severity'],
                     title=inc['title'],
                     count=inc['count'],
@@ -174,20 +181,7 @@ def _decode_file(file_bytes: bytes) -> str:
     return file_bytes.decode('utf-8', errors='replace')
 
 
-def _calculate_score(count: int, severity: str) -> float:
-    """Calculate incident score based on count and severity."""
-    severity_weights = {
-        'FATAL': 100,
-        'CRITICAL': 90,
-        'ERROR': 50,
-        'WARN': 20,
-        'WARNING': 20,
-        'INFO': 5,
-        'DEBUG': 1,
-        'TRACE': 1,
-    }
-    weight = severity_weights.get(severity, 5)
-    return round(count * weight * 0.1, 2)
+# _calculate_score removed - now using ranking module
 
 
 def _persist_run(
@@ -213,6 +207,7 @@ def _persist_run(
             rank=inc['rank'],
             signature=inc['signature'],
             score=inc['score'],
+            priority=inc['priority'],
             severity=inc['severity'],
             title=inc['title'],
             count=inc['count'],

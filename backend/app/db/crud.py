@@ -33,6 +33,7 @@ def save_incident(
     rank: int,
     signature: str,
     score: float,
+    priority: str,
     severity: str,
     title: str,
     count: int,
@@ -50,16 +51,15 @@ def save_incident(
         conn.execute(
             """
             INSERT INTO incidents (
-                incident_id, run_id, rank, signature, score, severity, title,
+                incident_id, run_id, rank, signature, score, priority, severity, title,
                 count, services_json, first_seen, last_seen, stats_json,
                 evidence_json, explanation_json, used_llm, validation_errors_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                incident_id, run_id, rank, signature, score, severity, title,
+                incident_id, run_id, rank, signature, score, priority, severity, title,
                 count, json.dumps(services), first_seen, last_seen,
-                json.dumps(stats), json.dumps(
-                    evidence), json.dumps(explanation),
+                json.dumps(stats), json.dumps(evidence), json.dumps(explanation),
                 1 if used_llm else 0,
                 json.dumps(validation_errors) if validation_errors else None
             )
@@ -124,7 +124,7 @@ def list_incidents_for_run(run_id: str) -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT incident_id, run_id, rank, score, severity, title, count,
+            SELECT incident_id, run_id, rank, score, priority, severity, title, count,
                    services_json, first_seen, last_seen
             FROM incidents
             WHERE run_id = ?

@@ -120,6 +120,7 @@ async def get_run_detail(run_id: str):
                     incident_id=inc['incident_id'],
                     rank=inc['rank'],
                     score=inc['score'],
+                    priority=inc.get('priority', 'P3'),
                     severity=inc['severity'],
                     title=inc['title'],
                     count=inc['count'],

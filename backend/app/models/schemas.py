@@ -105,6 +105,7 @@ class IncidentSummary(BaseModel):
     incident_id: str
     rank: int
     score: float
+    priority: str = "P3"  # P0=critical, P1=high, P2=medium, P3=low
     severity: str
     title: str
     count: int

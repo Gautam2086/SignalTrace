@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     rank INTEGER NOT NULL,
     signature TEXT NOT NULL,
     score REAL NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'P3',
     severity TEXT NOT NULL,
     title TEXT NOT NULL,
     count INTEGER NOT NULL,
