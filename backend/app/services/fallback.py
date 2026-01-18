@@ -35,7 +35,8 @@ def generate_fallback_explanation(
         recommended_next_steps=next_steps,
         confidence="low",
         caveats=[
-            "This is an automated analysis without LLM assistance",
+            "This is a pattern-based analysis without LLM assistance",
+            "Root cause hypothesis based only on keywords in provided logs",
             "Manual review recommended for accurate root cause identification"
         ],
         referenced_line_numbers=referenced_lines
@@ -139,10 +140,10 @@ def _generate_likely_causes(evidence: EvidenceBundle) -> List[LikelyCause]:
             evidence_line_numbers=line_numbers[:2]
         ))
 
-    # Default cause if no patterns matched
+    # Default cause if no patterns matched - use safe "unknown" phrasing
     if not causes:
         causes.append(LikelyCause(
-            hypothesis="Application error requiring manual investigation",
+            hypothesis="Unknown based on provided logs - manual investigation required",
             evidence_line_numbers=line_numbers[:2] if line_numbers else []
         ))
 

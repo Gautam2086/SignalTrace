@@ -1,5 +1,6 @@
 import json
-from typing import Tuple, List, Optional, Dict, Any
+import re
+from typing import Tuple, List, Optional, Dict, Any, Set
 from pydantic import ValidationError
 from app.models.schemas import EvidenceBundle, IncidentExplanation, LikelyCause
 from app.services.llm_client import explain_incident, fix_json_with_llm
@@ -7,6 +8,74 @@ from app.services.fallback import generate_fallback_explanation
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Banned phrases that indicate unsafe or overconfident LLM outputs
+BANNED_PHRASES = [
+    "definitely", "root cause is", "must be", "guaranteed",
+    "fix by", "rollback", "roll back", "deploy immediately",
+    "restart database", "increase pool size", "delete", "drop table"
+]
+
+# Regex patterns for extracting IPs and ports
+IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+PORT_PATTERN = re.compile(r":(\d{2,5})\b")
+
+
+def _extract_ips(text: str) -> Set[str]:
+    """Extract all IPv4 addresses from text."""
+    return set(IP_PATTERN.findall(text))
+
+
+def _extract_ports(text: str) -> Set[str]:
+    """Extract all port numbers from text."""
+    return set(PORT_PATTERN.findall(text))
+
+
+def _check_grounding(
+    explanation: IncidentExplanation,
+    evidence: EvidenceBundle
+) -> List[str]:
+    """
+    Perform strict grounding checks on LLM output.
+    
+    Validates that LLM doesn't hallucinate IPs/ports or use unsafe language.
+    """
+    issues: List[str] = []
+    
+    # Collect all text from evidence
+    evidence_text = " ".join(line.raw_line for line in evidence.sample_lines)
+    evidence_ips = _extract_ips(evidence_text)
+    evidence_ports = _extract_ports(evidence_text)
+    
+    # Collect all text from explanation
+    output_parts = [
+        explanation.what_happened,
+        *[cause.hypothesis for cause in explanation.likely_causes],
+        *explanation.recommended_next_steps,
+        *explanation.caveats
+    ]
+    output_text = " ".join(output_parts)
+    output_text_lower = output_text.lower()
+    
+    # Check for invented IPs
+    output_ips = _extract_ips(output_text)
+    invented_ips = output_ips - evidence_ips
+    if invented_ips:
+        issues.append(f"Hallucinated IP address(es): {sorted(invented_ips)}")
+    
+    # Check for invented ports
+    output_ports = _extract_ports(output_text)
+    invented_ports = output_ports - evidence_ports
+    if invented_ports:
+        issues.append(f"Hallucinated port number(s): {sorted(invented_ports)}")
+    
+    # Check for banned unsafe phrases
+    for phrase in BANNED_PHRASES:
+        if phrase in output_text_lower:
+            issues.append(f"Unsafe/overconfident phrase detected: '{phrase}'")
+            break  # Report only first match
+    
+    return issues
 
 
 def get_validated_explanation(
@@ -36,8 +105,15 @@ def get_validated_explanation(
     explanation, errors = _validate_explanation(raw_response, evidence)
 
     if explanation:
-        logger.info("LLM explanation validated successfully")
-        return explanation, True, []
+        # Perform strict grounding checks
+        grounding_issues = _check_grounding(explanation, evidence)
+        if grounding_issues:
+            logger.warning(f"Grounding check failed: {grounding_issues}")
+            validation_errors.extend(grounding_issues)
+            # Fall through to retry
+        else:
+            logger.info("LLM explanation validated successfully")
+            return explanation, True, []
 
     # Validation failed - try to fix with retry
     validation_errors.extend(errors)
@@ -51,10 +127,14 @@ def get_validated_explanation(
         explanation, retry_errors = _validate_explanation(
             fixed_response, evidence)
         if explanation:
-            logger.info("LLM explanation fixed and validated on retry")
-            # Include original errors for logging
-            return explanation, True, validation_errors
-        validation_errors.extend(retry_errors)
+            # Check grounding on retry too
+            grounding_issues = _check_grounding(explanation, evidence)
+            if not grounding_issues:
+                logger.info("LLM explanation fixed and validated on retry")
+                return explanation, True, validation_errors
+            validation_errors.extend(grounding_issues)
+        else:
+            validation_errors.extend(retry_errors)
 
     # All attempts failed - use fallback
     logger.warning("LLM validation failed after retry, using fallback")
