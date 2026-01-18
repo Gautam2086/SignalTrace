@@ -108,7 +108,4 @@ To customize LLM prompts:
 1. Edit `app/services/llm_client.py`
 2. Modify the prompt in `explain_incident()`
 
-## License
-
-MIT
 
