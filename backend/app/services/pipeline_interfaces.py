@@ -1,30 +1,20 @@
-import re
-import json
+"""
+Pipeline interfaces for log parsing, grouping, and evidence collection.
+Converts raw log lines into structured incidents for analysis.
+"""
 import hashlib
-from typing import List, Dict, Optional
+from typing import List, Optional
 from datetime import datetime
-from collections import defaultdict
+
 from app.models.schemas import (
     ParsedLogLine, IncidentGroup, TimeWindow,
     EvidenceBundle, SampleLine, IncidentStats
 )
-
-# Regex patterns for log parsing
-TIMESTAMP_PATTERNS = [
-    r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)',
-    r'(\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2})',
-    r'(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})',
-]
-
-LOG_LEVEL_PATTERN = r'\b(ERROR|WARN(?:ING)?|INFO|DEBUG|FATAL|CRITICAL|TRACE)\b'
-SERVICE_PATTERN = r'\[([a-zA-Z0-9_\-\.]+)\]'
-
-# Normalization patterns for signature generation
-UUID_PATTERN = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
-HEX_PATTERN = r'\b[0-9a-fA-F]{16,}\b'
-IP_PATTERN = r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'
-NUMBER_PATTERN = r'\b\d+\b'
-PATH_PATTERN = r'/[a-zA-Z0-9_\-\./]+'
+from app.services.log_pipeline import (
+    parse_logs_from_text, group_logs, normalize_message
+)
+from app.services.log_pipeline.parser import LogRecord
+from app.services.log_pipeline.grouping import LogGroup
 
 SEVERITY_WEIGHTS = {
     'FATAL': 100,
@@ -41,175 +31,110 @@ SEVERITY_WEIGHTS = {
 def parse_lines(lines: List[str]) -> List[ParsedLogLine]:
     """
     Parse raw log lines into structured ParsedLogLine objects.
-
-    Attempts JSON parsing first, then falls back to regex-based parsing.
-    This is a placeholder implementation - teammates can improve parsing logic.
+    Supports JSON and plain-text log formats with line number tracking.
     """
+    raw_text = "\n".join(lines)
+    log_records = parse_logs_from_text(raw_text)
+    
+    # Build line number mapping for evidence grounding
+    line_to_number = {}
+    for i, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if stripped:
+            line_to_number[stripped] = i
+    
     parsed = []
-
-    for i, raw_line in enumerate(lines, start=1):
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        parsed_line = _try_parse_json(line, i, raw_line)
-        if not parsed_line:
-            parsed_line = _parse_with_regex(line, i, raw_line)
-
-        parsed.append(parsed_line)
-
-    return parsed
-
-
-def _try_parse_json(line: str, line_number: int, raw_line: str) -> Optional[ParsedLogLine]:
-    """Try to parse line as JSON log entry."""
-    try:
-        data = json.loads(line)
-        if not isinstance(data, dict):
-            return None
-
-        # Extract common JSON log fields
-        timestamp = data.get('timestamp') or data.get(
-            'time') or data.get('@timestamp') or data.get('ts')
-        level = data.get('level') or data.get(
-            'severity') or data.get('log_level')
-        service = data.get('service') or data.get(
-            'app') or data.get('logger') or data.get('name')
-        message = data.get('message') or data.get(
-            'msg') or data.get('text') or str(data)
-
-        if level:
-            level = level.upper()
-
-        return ParsedLogLine(
+    for record in log_records:
+        line_number = line_to_number.get(record.raw.strip(), 0)
+        if line_number == 0:
+            line_number = len(parsed) + 1
+        
+        parsed.append(ParsedLogLine(
             line_number=line_number,
-            timestamp=str(timestamp) if timestamp else None,
-            service=str(service) if service else None,
-            level=level,
-            message=str(message),
-            raw_line=raw_line
-        )
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-def _parse_with_regex(line: str, line_number: int, raw_line: str) -> ParsedLogLine:
-    """Parse line using regex patterns."""
-    timestamp = None
-    for pattern in TIMESTAMP_PATTERNS:
-        match = re.search(pattern, line)
-        if match:
-            timestamp = match.group(1)
-            break
-
-    level_match = re.search(LOG_LEVEL_PATTERN, line, re.IGNORECASE)
-    level = level_match.group(1).upper() if level_match else None
-
-    service_match = re.search(SERVICE_PATTERN, line)
-    service = service_match.group(1) if service_match else None
-
-    # Message is the remaining content after removing known parts
-    message = line
-    if timestamp:
-        message = message.replace(timestamp, '', 1)
-    if level:
-        message = re.sub(LOG_LEVEL_PATTERN, '', message,
-                         count=1, flags=re.IGNORECASE)
-    if service:
-        message = message.replace(f'[{service}]', '', 1)
-    message = re.sub(r'^[\s\-:]+', '', message).strip()
-
-    if not message:
-        message = line
-
-    return ParsedLogLine(
-        line_number=line_number,
-        timestamp=timestamp,
-        service=service,
-        level=level,
-        message=message,
-        raw_line=raw_line
-    )
-
-
-def _normalize_message(message: str) -> str:
-    """Normalize a message to create a grouping signature."""
-    normalized = message
-    normalized = re.sub(UUID_PATTERN, '{UUID}', normalized)
-    normalized = re.sub(HEX_PATTERN, '{HEX}', normalized)
-    normalized = re.sub(IP_PATTERN, '{IP}', normalized)
-    normalized = re.sub(NUMBER_PATTERN, '{N}', normalized)
-    # Truncate for grouping
-    return normalized[:200]
-
-
-def _get_signature_hash(signature: str) -> str:
-    """Create a short hash for the signature."""
-    return hashlib.md5(signature.encode()).hexdigest()[:12]
+            timestamp=record.timestamp.isoformat() if record.timestamp else None,
+            service=record.service if record.service != "unknown" else None,
+            level=record.level if record.level != "UNKNOWN" else None,
+            message=record.message,
+            raw_line=record.raw
+        ))
+    
+    return parsed
 
 
 def group_and_rank(parsed: List[ParsedLogLine]) -> List[IncidentGroup]:
     """
-    Group related log entries into incidents and rank by severity/count.
-
-    Groups by normalized message signature, ranks by count × severity weight.
-    This is a placeholder implementation - teammates can improve grouping logic.
+    Group related log entries into incidents and rank by severity and frequency.
+    Uses message normalization to cluster similar errors together.
     """
-    groups: Dict[str, List[ParsedLogLine]] = defaultdict(list)
-
-    for log in parsed:
-        signature = _normalize_message(log.message)
-        groups[signature].append(log)
-
+    log_records = []
+    
+    for p in parsed:
+        ts = datetime.utcnow()
+        if p.timestamp:
+            ts = _parse_timestamp(p.timestamp) or datetime.utcnow()
+        
+        record = LogRecord(
+            timestamp=ts,
+            service=p.service or "unknown",
+            level=p.level or "UNKNOWN",
+            message=p.message,
+            raw=p.raw_line
+        )
+        log_records.append(record)
+    
+    log_groups = group_logs(log_records)
+    
     incidents = []
-    for signature, lines in groups.items():
-        # Determine severity (highest level in group)
-        severities = [line.level for line in lines if line.level]
-        if severities:
-            severity = max(
-                severities, key=lambda s: SEVERITY_WEIGHTS.get(s, 0))
-        else:
-            severity = 'INFO'
-
-        # Collect timestamps for time window
-        timestamps = [line.timestamp for line in lines if line.timestamp]
+    for lg in log_groups:
+        group_lines = []
+        for rec in [r for r in log_records if normalize_message(r.message) == lg.normalized_message 
+                    and r.service == lg.service and r.level == lg.level]:
+            for p in parsed:
+                if p.raw_line == rec.raw:
+                    group_lines.append(p)
+                    break
+        
+        seen = set()
+        unique_lines = []
+        for line in group_lines:
+            key = (line.line_number, line.raw_line)
+            if key not in seen:
+                seen.add(key)
+                unique_lines.append(line)
+        
+        # Build time window
+        timestamps = [l.timestamp for l in unique_lines if l.timestamp]
         time_window = TimeWindow()
         if timestamps:
             sorted_ts = sorted(timestamps)
-            time_window = TimeWindow(
-                first_seen=sorted_ts[0], last_seen=sorted_ts[-1])
-
-        # Collect unique services
-        services = list(set(line.service for line in lines if line.service))
-
+            time_window = TimeWindow(first_seen=sorted_ts[0], last_seen=sorted_ts[-1])
+        
+        services = list(set(l.service for l in unique_lines if l.service))
+        
         incidents.append(IncidentGroup(
-            signature=signature,
-            lines=lines,
-            count=len(lines),
-            severity=severity,
+            signature=lg.normalized_message,
+            lines=unique_lines,
+            count=lg.count,
+            severity=lg.level,
             time_window=time_window,
             services=services
         ))
-
+    
     # Rank by score (count × severity weight)
     incidents.sort(
         key=lambda x: x.count * SEVERITY_WEIGHTS.get(x.severity, 1),
         reverse=True
     )
-
+    
     return incidents
 
 
 def build_evidence(group: IncidentGroup, max_samples: int = 8) -> EvidenceBundle:
     """
     Build evidence bundle for an incident group.
-
     Selects representative sample lines and computes statistics.
-    This is a placeholder implementation - teammates can improve evidence selection.
     """
     lines = group.lines
-
-    # Select sample lines: first, last, and distributed middle points
     sample_indices = _select_sample_indices(len(lines), max_samples)
     sample_lines = [
         SampleLine(
@@ -223,7 +148,6 @@ def build_evidence(group: IncidentGroup, max_samples: int = 8) -> EvidenceBundle
         for i in sample_indices
     ]
 
-    # Top unique messages (deduplicated)
     seen_messages = set()
     top_messages = []
     for line in lines:
@@ -231,12 +155,9 @@ def build_evidence(group: IncidentGroup, max_samples: int = 8) -> EvidenceBundle
             top_messages.append(line.message)
             seen_messages.add(line.message)
 
-    # Compute stats
-    error_count = sum(1 for line in lines if line.level in (
-        'ERROR', 'FATAL', 'CRITICAL'))
+    error_count = sum(1 for line in lines if line.level in ('ERROR', 'FATAL', 'CRITICAL'))
     warn_count = sum(1 for line in lines if line.level in ('WARN', 'WARNING'))
 
-    # Calculate time span
     time_span_seconds = None
     if group.time_window.first_seen and group.time_window.last_seen:
         try:
@@ -265,14 +186,11 @@ def build_evidence(group: IncidentGroup, max_samples: int = 8) -> EvidenceBundle
 
 
 def _select_sample_indices(total: int, max_samples: int) -> List[int]:
-    """Select indices for representative samples."""
+    """Select evenly distributed sample indices."""
     if total <= max_samples:
         return list(range(total))
 
-    # Always include first and last
     indices = [0, total - 1]
-
-    # Add evenly distributed middle points
     remaining = max_samples - 2
     step = total / (remaining + 1)
     for i in range(1, remaining + 1):
@@ -284,8 +202,10 @@ def _select_sample_indices(total: int, max_samples: int) -> List[int]:
 
 
 def _parse_timestamp(ts: str) -> Optional[datetime]:
-    """Try to parse timestamp string to datetime."""
+    """Parse timestamp string to datetime object."""
     formats = [
+        '%Y-%m-%dT%H:%M:%S.%f%z',
+        '%Y-%m-%dT%H:%M:%S%z',
         '%Y-%m-%dT%H:%M:%S.%fZ',
         '%Y-%m-%dT%H:%M:%SZ',
         '%Y-%m-%dT%H:%M:%S.%f',
@@ -299,6 +219,11 @@ def _parse_timestamp(ts: str) -> Optional[datetime]:
         except ValueError:
             continue
     return None
+
+
+def _get_signature_hash(signature: str) -> str:
+    """Create a short hash for the signature."""
+    return hashlib.md5(signature.encode()).hexdigest()[:12]
 
 
 def generate_incident_id(run_id: str, signature: str, rank: int) -> str:
